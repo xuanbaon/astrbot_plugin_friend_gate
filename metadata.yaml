@@ -1,0 +1,22 @@
+name: friend_gate
+display_name: 好友门卫
+short_desc: 自动处理 QQ 好友申请，带黑名单、暗号和频率限制
+desc: >-
+  AstrBot 本身不处理 OneBot 的 request 事件，好友申请会一直躺在 QQ 里没人管。
+  这个插件订阅协议端的好友申请事件，按黑名单 / 白名单 / 验证语暗号 / 每小时上限
+  决定同意还是拒绝，并把结果私聊告诉管理员。同一个申请只会处理一次，误操作可以暂停。
+help: |-
+  /好友                查看运行状态与累计统计
+  /好友 关             暂停自动处理（申请先留着）
+  /好友 开             恢复自动处理
+  /好友 记录           查看最近处理过的申请
+  /好友 路径           打印状态文件位置
+  /好友 测试 <QQ> [验证语]   只试跑判定规则，不会真的同意
+version: 1.1.0
+author: xuanbaon
+repo: https://github.com/xuanbaon/astrbot_plugin_friend_gate
+astrbot_version: ">=4.17.0"
+tags:
+  - 好友
+  - 自动处理
+  - 运维
