@@ -140,16 +140,75 @@ class FriendGate(Star):
             return False
         return bool(self._cfg("enabled", True))
 
-    def _list(self, key: str) -> list[str]:
-        raw = self._cfg(key, []) or []
+    @staticmethod
+    def _normalize(raw: Any) -> list[str]:
+        """把配置里的 list / 逗号字符串统一成去空的字符串列表。"""
         if isinstance(raw, str):
-            raw = [item for item in raw.replace("，", ",").split(",")]
+            raw = raw.replace("，", ",").split(",")
         out: list[str] = []
-        for item in raw:
-            text = str(item).strip()
-            if text:
-                out.append(text)
+        try:
+            for item in raw or []:
+                text = str(item).strip()
+                if text:
+                    out.append(text)
+        except Exception:
+            return []
         return out
+
+    def _list(self, key: str) -> list[str]:
+        return self._normalize(self._cfg(key, []) or [])
+
+    # ---------------- 验证语 / 暗号（命令可改，改动立即生效） ----------------
+    def _friend_keywords(self) -> list[str]:
+        override = self.state.get("filter_override") or {}
+        if isinstance(override, dict) and "require_keyword" in override:
+            return self._normalize(override.get("require_keyword"))
+        return self._list("filter.require_keyword")
+
+    def _friend_require_comment(self) -> bool:
+        override = self.state.get("filter_override") or {}
+        if isinstance(override, dict) and "require_comment" in override:
+            return bool(override.get("require_comment"))
+        return bool(self._cfg("filter.require_comment", False))
+
+    def _friend_reject_reason(self) -> str:
+        override = self.state.get("filter_override") or {}
+        if isinstance(override, dict) and "reject_reason" in override:
+            return str(override.get("reject_reason") or "").strip()
+        return str(self._cfg("reject.reject_reason", "") or "").strip()
+
+    def _group_keywords(self) -> list[str]:
+        override = self.state.get("group_override") or {}
+        if isinstance(override, dict) and "require_keyword" in override:
+            return self._normalize(override.get("require_keyword"))
+        return self._list("group.require_keyword")
+
+    @staticmethod
+    def _apply_keyword_edit(current: list[str], arg: str) -> tuple[list[str], list[str]]:
+        """支持：裸词覆盖 / +词 追加 / -词 删除 / 空 清空。"""
+        tokens = [t.strip() for t in arg.replace("，", ",").replace("、", ",").split(",")]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return current, []
+        if len(tokens) == 1 and tokens[0] in ("空", "清空", "clear"):
+            return [], ["清空"]
+        additive = any(tok[0] in "+-" for tok in tokens)
+        if not additive:
+            return tokens, [f"设为 {'/'.join(tokens)}"]
+        new = list(current)
+        changed: list[str] = []
+        for tok in tokens:
+            sign = tok[0] if tok[0] in "+-" else "+"
+            word = tok[1:] if tok[0] in "+-" else tok
+            if not word:
+                continue
+            if sign == "+" and word not in new:
+                new.append(word)
+                changed.append(f"+{word}")
+            elif sign == "-" and word in new:
+                new.remove(word)
+                changed.append(f"-{word}")
+        return new, changed
 
     # ---------------- 状态 ----------------
     def _state_path(self) -> Path:
@@ -292,7 +351,7 @@ class FriendGate(Star):
             if group_id and group_id in whitelist:
                 return "approve", "群白名单"
             return "skip", "不在群白名单，留待人工确认"
-        keywords = self._list("group.require_keyword")
+        keywords = self._group_keywords()
         if keywords:
             text = (comment or "").lower()
             if not any(word.lower() in text for word in keywords):
@@ -338,7 +397,7 @@ class FriendGate(Star):
         whitelist = self._list("filter.whitelist")
         if user_id in whitelist:
             return "approve", "白名单"
-        keywords = self._list("filter.require_keyword")
+        keywords = self._friend_keywords()
         if keywords:
             text = (comment or "").lower()
             if not any(word.lower() in text for word in keywords):
@@ -395,7 +454,7 @@ class FriendGate(Star):
         if request_type == "friend":
             if self._dup(flag):
                 return
-            if not (comment or "").strip() and self._cfg("filter.require_comment", False):
+            if not (comment or "").strip() and self._friend_require_comment():
                 action, reason = "reject", "要求填写验证语，但对方没填"
             else:
                 action, reason = self._decide(user_id, comment)
@@ -417,7 +476,7 @@ class FriendGate(Star):
 
             approve = action == "approve"
             remark = self._remark(user_id, nickname, comment) if approve else ""
-            reason_text = "" if approve else str(self._cfg("reject.reject_reason", "") or "").strip()
+            reason_text = "" if approve else self._friend_reject_reason()
 
             params: dict[str, Any] = {"flag": flag, "approve": approve}
             if remark:
@@ -734,10 +793,11 @@ class FriendGate(Star):
     @filter.command("好友")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def friend_cmd(self, event: AstrMessageEvent, raw_args: GreedyStr):
-        """好友门卫：/好友、/好友 开|关、/好友 记录、/好友 群、/好友 群测试 <群号>"""
+        """好友门卫：/好友、/好友 开|关、/好友 记录、/好友 暗号、/好友 群、/好友 群测试 <群号>"""
         parts = str(raw_args or "").split()
         sub = parts[0] if parts else ""
         arg = " ".join(parts[1:]).strip()
+        logger.info(f"[friend_gate] 收到命令：/好友 {sub} {arg}".rstrip())
 
         # 顺手自检：热重载后钩子可能丢了，这里补挂一次。
         await self._install_hooks()
@@ -788,6 +848,81 @@ class FriendGate(Star):
             )
             return
 
+        # ---------------- 验证语 / 暗号 ----------------
+        if sub in ("暗号", "验证语", "关键词"):
+            current = self._friend_keywords()
+            if not arg:
+                yield event.plain_result(
+                    f"当前验证语暗号：{'/'.join(current) if current else '不校验（谁加都同意）'}\n\n"
+                    "改法：\n"
+                    "/好友 暗号 老王            → 设为「老王」\n"
+                    "/好友 暗号 老王,朋友        → 设为多个（命中任一即可）\n"
+                    "/好友 暗号 +同学            → 追加一个\n"
+                    "/好友 暗号 -老王            → 删掉一个\n"
+                    "/好友 暗号 空               → 清空，恢复不校验\n\n"
+                    "注意：暗号是「对方加你时填的那句话」里要包含的词，不是让他看到提示。\n"
+                    "对方没填验证语 = 暗号不命中 = 会被拒绝。多数人不填，建议配「必填」先观察。"
+                )
+                return
+            new, changed = self._apply_keyword_edit(current, arg)
+            self.state.setdefault("filter_override", {})["require_keyword"] = new
+            self._save_state()
+            yield event.plain_result(
+                f"验证语暗号已更新：{'、'.join(changed) if changed else '没有变化'}\n"
+                f"现在：{'/'.join(new) if new else '不校验'}"
+            )
+            return
+
+        if sub in ("必填", "要求填写", "必须填"):
+            override = self.state.setdefault("filter_override", {})
+            if not arg:
+                now = self._friend_require_comment()
+                yield event.plain_result(
+                    f"必须填写验证语：{'开' if now else '关'}\n"
+                    "开启后，验证语为空的好友申请直接拒绝。\n"
+                    "用法：/好友 必填 开 | /好友 必填 关"
+                )
+                return
+            if arg in ("开", "on", "是", "启用"):
+                override["require_comment"] = True
+                self._save_state()
+                yield event.plain_result("已开启：验证语为空的好友申请会被拒绝。")
+                return
+            if arg in ("关", "off", "否", "停用"):
+                override["require_comment"] = False
+                self._save_state()
+                yield event.plain_result("已关闭：验证语为空也照常按暗号等规则判定。")
+                return
+            yield event.plain_result("用法：/好友 必填 开 或 /好友 必填 关")
+            return
+
+        if sub in ("拒绝理由", "理由"):
+            override = self.state.setdefault("filter_override", {})
+            if not arg:
+                now = self._friend_reject_reason()
+                yield event.plain_result(
+                    f"拒绝好友申请时的回复：{now or '（空，不回复）'}\n\n"
+                    "改法：/好友 拒绝理由 不认识的人不加\n"
+                    "       /好友 拒绝理由 空   → 清空\n\n"
+                    "提示：SnowLuma 的 set_friend_add_request 只接受 flag + approve，\n"
+                    "不接受任何回复内容，这条配置在它上面不会生效（会自动降级，不影响拒绝）。\n"
+                    "换 NapCat / Lagrange 之类支持 reason 的协议端才有用。"
+                )
+                return
+            text = arg.strip()
+            if text in ("空", "清空", "clear"):
+                override["reject_reason"] = ""
+                self._save_state()
+                yield event.plain_result("已清空拒绝回复。")
+                return
+            override["reject_reason"] = text[:60]
+            self._save_state()
+            yield event.plain_result(
+                f"拒绝回复已设为：{text[:60]}\n"
+                "（协议端支持 reason 参数时才会真的发出去，SnowLuma 不支持，只会降级成静默拒绝）"
+            )
+            return
+
         # ---------------- 群请求相关命令 ----------------
         if sub in ("群开", "群关", "邀请开", "邀请关", "加群开", "加群关"):
             target = "add" if sub.startswith("加群") else "invite"
@@ -800,6 +935,23 @@ class FriendGate(Star):
                 f"已{'开启' if on else '关闭'}自动同意{what}。"
                 + ("" if on else "（之后收到的会原样留在 QQ 里）")
                 + "\n用 /好友 群 查看完整状态。"
+            )
+            return
+
+        if sub in ("群暗号", "邀请暗号"):
+            current = self._group_keywords()
+            if not arg:
+                yield event.plain_result(
+                    f"当前邀请附言暗号：{'/'.join(current) if current else '不校验'}\n"
+                    "用法：/好友 群暗号 老王 / 好友 群暗号 +同学 / 好友 群暗号 空"
+                )
+                return
+            new, changed = self._apply_keyword_edit(current, arg)
+            self.state.setdefault("group_override", {})["require_keyword"] = new
+            self._save_state()
+            yield event.plain_result(
+                f"邀请附言暗号已更新：{'、'.join(changed) if changed else '没有变化'}\n"
+                f"现在：{'/'.join(new) if new else '不校验'}"
             )
             return
 
@@ -867,7 +1019,7 @@ class FriendGate(Star):
             stats = self.state.get("stats", {})
             wl = self._group_list("whitelist")
             bl = self._group_list("blacklist")
-            kw = self._list("group.require_keyword")
+            kw = self._group_keywords()
             master = self._enabled()
             inv = self._group_switch_raw("invite")
             join = self._group_switch_raw("add")
@@ -886,23 +1038,25 @@ class FriendGate(Star):
                 "",
                 "开关：/好友 群开 | 群关 | 加群开 | 加群关",
                 "名单：/好友 群白 群号 | 群黑 群号（-群号 删除，空 清空）",
+                "暗号：/好友 群暗号 词 | 群暗号 空",
             ]
             yield event.plain_result("\n".join(lines))
             return
 
-        keywords = self._list("filter.require_keyword")
+        keywords = self._friend_keywords()
         stats = self.state.get("stats", {})
         last = ""
         recent = self.state.get("recent") or []
         if recent:
             last = f"　最近：{recent[-1].get('ts', '')} {recent[-1].get('action', '')}"
+        reject_reason = self._friend_reject_reason()
         lines = [
             "好友门卫",
             f"自动同意：{'开' if self._enabled() else '关'}"
             f"（面板开关 {'开' if self._cfg('enabled', True) else '关'}"
             f"{'，命令暂停中' if self.state.get('paused') else ''}）",
-            f"暗号：{'/'.join(keywords) if keywords else '不校验'}"
-            f"{'（且必须填写验证语）' if self._cfg('filter.require_comment', False) else ''}",
+            f"验证语暗号：{'/'.join(keywords) if keywords else '不校验'}"
+            f"{'（且必须填写验证语）' if self._friend_require_comment() else ''}",
             f"黑名单 {len(self._list('filter.blacklist'))} 个 / "
             f"白名单 {len(self._list('filter.whitelist'))} 个",
             f"每小时上限：{self._cfg('filter.max_per_hour', 10)}",
@@ -912,6 +1066,9 @@ class FriendGate(Star):
             f"跳过 {stats.get('skipped', 0)}",
             f"钩子：{'已接管 ' + '/'.join(sorted(self._hooked)) if self._hooked else '未挂上（重载插件试试）'}"
             f"{last}",
+            "验证语：/好友 暗号 词 | 必填 开/关 | 拒绝理由 文本",
             "记录文件：/好友 路径",
         ]
+        if reject_reason:
+            lines.insert(6, f"拒绝时回复：{reject_reason}")
         yield event.plain_result("\n".join(lines))
