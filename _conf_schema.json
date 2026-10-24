@@ -15,7 +15,7 @@
     "description": "通知目标会话（可选）",
     "type": "string",
     "default": "",
-    "hint": "填了就直接发到这个会话，优先级高于 admins_id。形如 snowluma:FriendMessage:1926319056，默认留空。"
+    "hint": "填了就直接发到这个会话，优先级高于 admins_id。格式 <平台ID>:FriendMessage:<你的QQ号>。平台 ID 是面板「消息平台」里那个适配器的 id（默认常与类型同名，如 aiocqhttp，改过就以实际为准），默认留空。"
   },
   "friend_remark": {
     "description": "自动备注",
