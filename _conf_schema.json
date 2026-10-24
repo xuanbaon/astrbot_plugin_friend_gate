@@ -70,21 +70,75 @@
       }
     }
   },
+  "group": {
+    "description": "群请求（邀请与加群申请）",
+    "type": "object",
+    "hint": "被邀请进群、以及别人申请加入你管理的群时，是否自动同意。两块各有一个开关。",
+    "items": {
+      "enabled": {
+        "description": "自动同意入群邀请",
+        "type": "bool",
+        "default": false,
+        "hint": "有人把机器人拉进群时自动同意。打开后 /好友 群 里显示为「开」。"
+      },
+      "approve_join_request": {
+        "description": "自动同意加群申请",
+        "type": "bool",
+        "default": false,
+        "hint": "有人申请加入机器人当管理员的群时自动同意。需要机器人是群主或管理员，否则接口会失败。建议先观察一阵。"
+      },
+      "whitelist": {
+        "description": "只同意这些群（群号）",
+        "type": "list",
+        "default": [],
+        "hint": "留空表示不限群。填了就只同意名单里的群，其余邀请会留给你人工处理（不会拒绝）。"
+      },
+      "blacklist": {
+        "description": "拒绝这些群（群号）",
+        "type": "list",
+        "default": [],
+        "hint": "这些群的邀请一律拒绝。黑名单优先于白名单。"
+      },
+      "require_keyword": {
+        "description": "邀请附言暗号",
+        "type": "list",
+        "default": [],
+        "hint": "填了就要求邀请附言含其中一个词，否则拒绝。别拉群的人通常不写附言，谨慎开启。"
+      },
+      "max_per_hour": {
+        "description": "每小时最多自动同意几个群请求",
+        "type": "int",
+        "default": 5,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        },
+        "hint": "防止被恶意拉群刷屏。0 表示不限制；超限的不处理，留给你人工看。"
+      },
+      "reject_reason": {
+        "description": "拒绝入群时回复的理由",
+        "type": "string",
+        "default": "",
+        "hint": "留空则用协议端默认。协议端不支持该参数时会自动降级重试。"
+      },
+      "notify": {
+        "description": "群请求处理结果也通知管理员",
+        "type": "bool",
+        "default": true,
+        "hint": "和好友申请的通知共用上面的通知目标会话设置。"
+      }
+    }
+  },
   "reject": {
     "description": "拒绝设置",
     "type": "object",
     "items": {
       "reject_reason": {
-        "description": "拒绝时回复的理由",
+        "description": "拒绝好友申请时回复的理由",
         "type": "string",
         "default": "",
         "hint": "留空则用协议端默认。协议端不支持该参数时会自动降级，只做拒绝不附理由。"
-      },
-      "auto_approve_group_invite": {
-        "description": "顺便自动同意入群邀请",
-        "type": "bool",
-        "default": false,
-        "hint": "打开后，有人邀请机器人进群会自动同意。建议先不开。"
       }
     }
   }
