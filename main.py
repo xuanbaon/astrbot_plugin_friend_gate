@@ -1,15 +1,21 @@
-"""好友门卫 —— 自动处理 QQ 好友申请。
+"""好友门卫 —— 自动处理 QQ 好友申请与群邀请。
 
 AstrBot 只把 OneBot 的 request 事件当一条空消息丢进管道，没人处理的话
 申请就一直躺在 QQ 里。这个插件把它变成一个确定的动作：按黑/白名单、
 暗号、频率上限决定同意还是拒绝，并把结果告诉你。
+
+除了好友申请，同一套规则也管两种群请求：
+  · 群邀请（sub_type=invite）：有人把机器人拉进群
+  · 加群申请（sub_type=add）：有人申请加入机器人管理的群
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -34,9 +40,32 @@ DEDUP_TTL = 600
 # 记录里最多留多少条
 RECENT_LIMIT = 50
 
+# SnowLuma 的群请求 flag 不是标准 OneBot 的 add:<群号>:<uid>，
+# 而是 slreq:1:<sequence>:<群号>:<eventType>:<filtered>，
+# 事件里没带 group_id 时可以从这里抠出来。
+GROUP_FLAG_PREFIX = "slreq:"
+
 # client 对象的代际号。不能存在 client 自己身上：CQHttp 有属性代理，
 # 随手挂一个属性读回来可能变成 functools.partial。
 _GENERATIONS: dict[int, int] = {}
+
+# 当前唯一有效的实例。aiocqhttp 的订阅没法撤销，重载插件后旧实例的 handler
+# 还挂着；AstrBot 重载会换一份新的模块对象，模块级变量各算各的，所以旧实例
+# 拿自己的那份全局一看"我还是当前的"，照样处理 —— 同一条申请被处理两次。
+# 把标记挂在 sys 上（进程级，重载不会换），新旧实例读的是同一个地方。
+_ACTIVE_ATTR = "_astrbot_friend_gate_active"
+
+
+def _set_active(obj: Any) -> None:
+    setattr(sys, _ACTIVE_ATTR, weakref.ref(obj))
+
+
+def _is_active(obj: Any) -> bool:
+    ref = getattr(sys, _ACTIVE_ATTR, None)
+    try:
+        return ref is not None and ref() is obj
+    except Exception:
+        return False
 
 
 def _get(raw: Any, key: str, default: Any = None) -> Any:
@@ -60,6 +89,8 @@ class FriendGate(Star):
 
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context, config)
+        # 先认领"我是当前实例"，让上一个实例残留的 handler 立刻失效。
+        _set_active(self)
         self.config = config or {}
         try:
             self.base_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
@@ -70,6 +101,7 @@ class FriendGate(Star):
         self.state: dict = self._load_state()
         self._seen: dict[str, float] = {}
         self._stamps: list[float] = []
+        self._g_stamps: list[float] = []
         self._hooked: set[str] = set()
         self._hook_task: asyncio.Task | None = None
 
@@ -186,6 +218,114 @@ class FriendGate(Star):
             return False
         self._stamps.append(now)
         return True
+
+    # ---------------- 群请求 ----------------
+    def _group_switch_raw(self, sub_type: str) -> bool:
+        """不看总开关，只看这个群请求类型自己的开关（供 /好友 群 展示）。"""
+        override = self.state.get("group_override") or {}
+        key = "add" if sub_type == "add" else "invite"
+        if isinstance(override, dict) and key in override:
+            return bool(override.get(key))
+        if key == "add":
+            return bool(self._cfg("group.approve_join_request", False))
+        legacy = bool(self._cfg("reject.auto_approve_group_invite", False))
+        return bool(self._cfg("group.enabled", legacy))
+
+    def _group_on(self, sub_type: str) -> bool:
+        """群邀请和加群申请各有一个开关。
+
+        老版本把「自动同意入群邀请」藏在 reject 分组里，这里把它当
+        group.enabled 的兜底默认值，升级后不用重新配一遍。
+        """
+        if not self._enabled():
+            return False
+        return self._group_switch_raw(sub_type)
+
+    def _group_list(self, key: str) -> list[str]:
+        """配置里的静态名单 + 命令写进 state 的运行时名单，合并去重。
+
+        静态名单适合「装机时就想固定」的群；运行时名单方便临时加一个，
+        改完立刻生效，不用去面板翻配置。
+        """
+        merged: list[str] = list(self._list(f"group.{key}"))
+        runtime = self.state.get("group_filter", {}).get(key, [])
+        if isinstance(runtime, list):
+            merged.extend(str(item).strip() for item in runtime)
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in merged:
+            text = str(item).strip()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+        return out
+
+    def _group_rate_ok(self) -> bool:
+        """群请求单独限流，免得被拉群刷屏把额度占满。"""
+        try:
+            limit = int(self._cfg("group.max_per_hour", 5))
+        except Exception:
+            limit = 5
+        if limit <= 0:
+            return True
+        now = time.time()
+        self._g_stamps = [t for t in self._g_stamps if now - t < 3600]
+        if len(self._g_stamps) >= limit:
+            return False
+        self._g_stamps.append(now)
+        return True
+
+    def _decide_group(self, group_id: str, sub_type: str, comment: str) -> tuple[str, str]:
+        """返回 (approve|reject|skip, 原因)。"""
+        if not self._enabled():
+            return "skip", "总开关关闭"
+        if sub_type == "add":
+            if not self._group_on("add"):
+                return "skip", "未开启自动同意加群申请"
+        elif not self._group_on("invite"):
+            return "skip", "未开启自动同意入群邀请"
+
+        if group_id and group_id in self._group_list("blacklist"):
+            return "reject", "群黑名单"
+        whitelist = self._group_list("whitelist")
+        if whitelist:
+            if group_id and group_id in whitelist:
+                return "approve", "群白名单"
+            return "skip", "不在群白名单，留待人工确认"
+        keywords = self._list("group.require_keyword")
+        if keywords:
+            text = (comment or "").lower()
+            if not any(word.lower() in text for word in keywords):
+                return "reject", f"邀请附言不含暗号（{'/'.join(keywords)}）"
+        if not self._group_rate_ok():
+            return "skip", "超过每小时上限，留待人工处理"
+        return "approve", "自动通过"
+
+    @staticmethod
+    def _group_id_from_flag(flag: str) -> str:
+        """标准协议端在事件里带 group_id；SnowLuma 的 flag 里也有一份。"""
+        if not flag.startswith(GROUP_FLAG_PREFIX):
+            return ""
+        parts = flag.split(":")
+        if len(parts) >= 4 and parts[3].isdigit():
+            return parts[3]
+        return ""
+
+    async def _group_name(self, group_id: str, platform_id: str = "") -> str:
+        if not group_id:
+            return ""
+        try:
+            data = await asyncio.wait_for(
+                self._call_action(
+                    "get_group_info", platform_id=platform_id, group_id=int(group_id)
+                ),
+                timeout=4,
+            )
+        except Exception:
+            return ""
+        if isinstance(data, dict):
+            return str(data.get("group_name") or "")
+        return ""
 
     # ---------------- 判定 ----------------
     def _decide(self, user_id: str, comment: str) -> tuple[str, str]:
@@ -330,33 +470,105 @@ class FriendGate(Star):
                 )
             return
 
-        if request_type == "group" and sub_type == "invite":
-            if not self._cfg("reject.auto_approve_group_invite", False):
-                return
-            if self._dup(flag):
-                return
-            if not self._enabled():
-                return
+        if request_type == "group":
+            await self._handle_group_request(
+                flag=flag,
+                sub_type=sub_type or "invite",
+                group_id=group_id,
+                user_id=user_id,
+                nickname=nickname,
+                comment=comment,
+                platform_id=platform_id,
+            )
+
+    async def _handle_group_request(
+        self,
+        flag: str,
+        sub_type: str,
+        group_id: str,
+        user_id: str,
+        nickname: str,
+        comment: str,
+        platform_id: str = "",
+    ) -> None:
+        """群邀请（invite）与加群申请（add）共用一套判定。"""
+        if not flag:
+            return
+        # 事件里偶尔不带 group_id（SnowLuma 的邀请卡片就是这样），
+        # flag 里还有一份，先补上再判定，否则黑名单会失效。
+        if not group_id:
+            group_id = self._group_id_from_flag(flag)
+        is_join = sub_type == "add"
+        label = "加群申请" if is_join else "入群邀请"
+        if self._dup(flag):
+            return
+
+        action, reason = self._decide_group(group_id, sub_type, comment)
+        if action == "skip":
+            logger.info(f"[friend_gate] 跳过{label} 群 {group_id}（{reason}）")
+            self._bump("group_skipped")
+            self._push_recent(
+                {"ts": _now_str(), "user_id": user_id, "nickname": nickname,
+                 "comment": comment, "action": f"{label}跳过({group_id})",
+                 "reason": reason}
+            )
+            self._save_state()
+            # 开关是主动关的，就别每来一条都戳一下管理员了。
+            if "未开启" not in reason and reason != "总开关关闭" and self._cfg("group.notify", True):
+                await self._notify(
+                    f"{label} · 未处理\n群号：{group_id}\n邀请人：{user_id}"
+                    f"（{nickname or '未知'}）\n附言：{comment or '（无）'}\n原因：{reason}",
+                    platform_id,
+                )
+            return
+
+        approve = action == "approve"
+        params: dict[str, Any] = {"flag": flag, "approve": approve}
+        reason_text = ""
+        if not approve:
+            reason_text = str(self._cfg("group.reject_reason", "") or "").strip()
+            if reason_text:
+                params["reason"] = reason_text
+
+        result = await self._call_action(
+            "set_group_add_request", platform_id=platform_id, **params
+        )
+        degraded = ""
+        if result is None and reason_text:
+            # 和好友申请一样，多带字段可能被协议端拒掉，退回最简参数重试。
             result = await self._call_action(
                 "set_group_add_request",
                 platform_id=platform_id,
                 flag=flag,
-                sub_type=sub_type,
-                approve=True,
+                approve=approve,
             )
-            logger.info(f"[friend_gate] 已同意入群邀请 群 {group_id}，返回：{result is not None}")
-            self._bump("group_invited")
-            self._push_recent(
-                {"ts": _now_str(), "user_id": user_id, "nickname": nickname,
-                 "comment": comment, "action": f"入群邀请({group_id})", "reason": "自动同意"}
+            if result is not None:
+                degraded = "（协议端不支持拒绝理由，已按最简参数重试）"
+        ok = result is not None
+
+        self._bump("group_approved" if approve else "group_rejected")
+        self._push_recent(
+            {"ts": _now_str(), "user_id": user_id, "nickname": nickname,
+             "comment": comment,
+             "action": f"{'同意' if approve else '拒绝'}{label}({group_id})",
+             "reason": reason, "ok": ok}
+        )
+        self._save_state()
+        logger.info(
+            f"[friend_gate] {'已同意' if approve else '已拒绝'}{label} 群 {group_id}"
+            f"（邀请人 {user_id or '未知'}）原因：{reason}，接口返回：{ok}"
+        )
+        if self._cfg("group.notify", True):
+            title = f"{label} · {'已同意' if approve else '已拒绝'}"
+            name = await self._group_name(group_id, platform_id) if group_id else ""
+            await self._notify(
+                f"{title}\n群号：{group_id}"
+                + (f"\n群名：{name}" if name else "")
+                + f"\n邀请人：{user_id or '未知'}（{nickname or '未知'}）"
+                f"\n附言：{comment or '（无）'}\n依据：{reason}{degraded}"
+                + ("" if ok else "\n⚠️ 协议端没有回应，可能仍待人工处理"),
+                platform_id,
             )
-            self._save_state()
-            if self._cfg("notify_admin", True):
-                await self._notify(
-                    f"入群邀请 · 已同意\n群号：{group_id}\n邀请人：{user_id}\n"
-                    f"附言：{comment or '（无）'}",
-                    platform_id,
-                )
 
     async def _welcome(self, user_id: str, platform_id: str = "") -> str:
         """同意后给对方发一句欢迎语（默认关闭，避免打扰）。"""
@@ -459,18 +671,21 @@ class FriendGate(Star):
                 generation = _GENERATIONS.get(client_key, 0) + 1
                 _GENERATIONS[client_key] = generation
 
-                def _make(pid: str, gen: int, key: int):
+                def _make(pid: str, gen: int, key: int, owner: Any):
                     async def handler(event: Any) -> None:
                         try:
+                            # 重载后旧实例可能还挂着钩子，直接让位给新实例。
+                            if not _is_active(owner):
+                                return
                             if _GENERATIONS.get(key, 0) != gen:
                                 return  # 已被新实例接管
-                            await self._on_request(event, platform_id=pid)
+                            await owner._on_request(event, platform_id=pid)
                         except Exception as exc:
                             logger.error(f"[friend_gate] 处理申请出错：{exc}")
 
                     return handler
 
-                client.on_request()(_make(platform_id, generation, client_key))
+                client.on_request()(_make(platform_id, generation, client_key, self))
                 self._hooked.add(platform_id)
                 logger.info(f"[friend_gate] 已接管 {platform_id} 的好友申请事件")
             except Exception as exc:
@@ -504,6 +719,13 @@ class FriendGate(Star):
         task = getattr(self, "_hook_task", None)
         if task is not None and not task.done():
             task.cancel()
+        # 卸任时把自己的标记摘掉，别留个指向已停用实例的弱引用。
+        ref = getattr(sys, _ACTIVE_ATTR, None)
+        try:
+            if ref is not None and ref() is self:
+                delattr(sys, _ACTIVE_ATTR)
+        except Exception:
+            pass
 
     async def on_astrbot_loaded(self) -> None:
         await self._install_hooks()
@@ -512,7 +734,7 @@ class FriendGate(Star):
     @filter.command("好友")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def friend_cmd(self, event: AstrMessageEvent, raw_args: GreedyStr):
-        """好友门卫：/好友、/好友 开|关、/好友 记录、/好友 测试 <QQ>"""
+        """好友门卫：/好友、/好友 开|关、/好友 记录、/好友 群、/好友 群测试 <群号>"""
         parts = str(raw_args or "").split()
         sub = parts[0] if parts else ""
         arg = " ".join(parts[1:]).strip()
@@ -566,6 +788,108 @@ class FriendGate(Star):
             )
             return
 
+        # ---------------- 群请求相关命令 ----------------
+        if sub in ("群开", "群关", "邀请开", "邀请关", "加群开", "加群关"):
+            target = "add" if sub.startswith("加群") else "invite"
+            on = sub.endswith("开")
+            override = self.state.setdefault("group_override", {})
+            override[target] = on
+            self._save_state()
+            what = "加群申请" if target == "add" else "入群邀请"
+            yield event.plain_result(
+                f"已{'开启' if on else '关闭'}自动同意{what}。"
+                + ("" if on else "（之后收到的会原样留在 QQ 里）")
+                + "\n用 /好友 群 查看完整状态。"
+            )
+            return
+
+        if sub in ("群白", "群黑"):
+            key = "whitelist" if sub == "群白" else "blacklist"
+            name = "白名单" if key == "whitelist" else "黑名单"
+            current = self._group_list(key)
+            if not arg:
+                yield event.plain_result(
+                    f"群{name}（{len(current)} 个）：\n"
+                    + ("\n".join(f"· {gid}" for gid in current) if current else "（空）")
+                    + f"\n\n添加：/好友 {sub} 群号\n删除：/好友 {sub} -群号\n清空：/好友 {sub} 空"
+                )
+                return
+            bucket = self.state.setdefault("group_filter", {})
+            store = bucket.get(key)
+            if not isinstance(store, list):
+                store = bucket[key] = []
+            if arg.strip() in ("空", "清空", "clear"):
+                store.clear()
+                self._save_state()
+                yield event.plain_result(f"已清空运行时群{name}（面板里配置的静态名单不受影响）。")
+                return
+            changed: list[str] = []
+            for token in arg.replace("，", ",").split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                sign, num = (token[0], token[1:]) if token[0] in "+-" else ("+", token)
+                if not num.isdigit():
+                    continue
+                if sign == "+" and num not in store:
+                    store.append(num)
+                    changed.append(f"+{num}")
+                elif sign == "-" and num in store:
+                    store.remove(num)
+                    changed.append(f"-{num}")
+            self._save_state()
+            lines = [f"群{name}已更新：{'、'.join(changed) if changed else '没有变化'}"]
+            lines.append("当前：" + ("、".join(self._group_list(key)) or "（空）"))
+            if key == "whitelist" and self._group_list(key):
+                lines.append("提示：白名单非空后，只同意白名单里的群，其他群邀请会留给你人工处理。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if sub in ("群测试", "群试跑"):
+            if not arg:
+                yield event.plain_result("用法：/好友 群测试 <群号> [邀请附言]")
+                return
+            pieces = arg.split(maxsplit=1)
+            group_id = pieces[0]
+            comment = pieces[1] if len(pieces) > 1 else ""
+            action, reason = self._decide_group(group_id, "invite", comment)
+            label = {"approve": "会同意", "reject": "会拒绝", "skip": "不处理"}.get(action, action)
+            yield event.plain_result(
+                f"试跑结果（入群邀请）：{label}\n群号：{group_id}\n"
+                f"附言：{comment or '（无）'}\n依据：{reason}"
+            )
+            return
+
+        if sub in ("群", "群邀请", "邀请", "群状态"):
+            if arg:
+                yield event.plain_result("用法：/好友 群")
+                return
+            stats = self.state.get("stats", {})
+            wl = self._group_list("whitelist")
+            bl = self._group_list("blacklist")
+            kw = self._list("group.require_keyword")
+            master = self._enabled()
+            inv = self._group_switch_raw("invite")
+            join = self._group_switch_raw("add")
+            lines = [
+                "群请求门卫",
+                f"入群邀请（被拉进群）：{'开' if inv else '关'}"
+                f"{'（总开关关闭，实际不生效）' if inv and not master else ''}",
+                f"加群申请（有人申请进你的群）：{'开' if join else '关'}"
+                f"{'（总开关关闭，实际不生效）' if join and not master else ''}",
+                f"群白名单 {len(wl)} 个" + (f"：{'、'.join(wl[:8])}{'…' if len(wl) > 8 else ''}" if wl else "（空，不限群）"),
+                f"群黑名单 {len(bl)} 个" + (f"：{'、'.join(bl[:8])}{'…' if len(bl) > 8 else ''}" if bl else ""),
+                f"邀请附言暗号：{'/'.join(kw) if kw else '不校验'}",
+                f"每小时上限：{self._cfg('group.max_per_hour', 5)}",
+                f"累计：同意 {stats.get('group_approved', 0) + stats.get('group_invited', 0)}，"
+                f"拒绝 {stats.get('group_rejected', 0)}，跳过 {stats.get('group_skipped', 0)}",
+                "",
+                "开关：/好友 群开 | 群关 | 加群开 | 加群关",
+                "名单：/好友 群白 群号 | 群黑 群号（-群号 删除，空 清空）",
+            ]
+            yield event.plain_result("\n".join(lines))
+            return
+
         keywords = self._list("filter.require_keyword")
         stats = self.state.get("stats", {})
         last = ""
@@ -582,6 +906,8 @@ class FriendGate(Star):
             f"黑名单 {len(self._list('filter.blacklist'))} 个 / "
             f"白名单 {len(self._list('filter.whitelist'))} 个",
             f"每小时上限：{self._cfg('filter.max_per_hour', 10)}",
+            f"群请求：邀请 {'开' if self._group_on('invite') else '关'} / "
+            f"加群 {'开' if self._group_on('add') else '关'}（详情 /好友 群）",
             f"累计：同意 {stats.get('approved', 0)}，拒绝 {stats.get('rejected', 0)}，"
             f"跳过 {stats.get('skipped', 0)}",
             f"钩子：{'已接管 ' + '/'.join(sorted(self._hooked)) if self._hooked else '未挂上（重载插件试试）'}"
