@@ -210,6 +210,38 @@ class FriendGate(Star):
                 changed.append(f"-{word}")
         return new, changed
 
+    def _prefix_hint(self, umo: str | None = None) -> str:
+        """唤醒前缀不是 / 时，提醒用户命令该怎么写。
+
+        AstrBot 会先剥掉唤醒前缀再拿剩下的部分匹配命令名，
+        所以前缀是「@xxx」时发「/好友 群」匹配不上，会被当成聊天。
+        注意：全局配置里的 wake_prefix 可能和当前会话档案不一致，
+        所以要按 umo 取会话配置，拿不到再退回全局。
+        """
+        prefixes: Any = None
+        for getter in (
+            (lambda: self.context.get_config(umo)) if umo else None,
+            lambda: self.context.get_config(),
+        ):
+            if getter is None:
+                continue
+            try:
+                value = getter().get("wake_prefix")
+            except Exception:
+                continue
+            if value:
+                prefixes = value
+                break
+        if not prefixes:
+            return ""
+        prefix = str(prefixes[0]) if isinstance(prefixes, (list, tuple)) else str(prefixes)
+        if not prefix or prefix == "/":
+            return ""
+        return (
+            f"提示：当前唤醒前缀是「{prefix}」，群里发命令要写成 "
+            f"「{prefix}好友 群」；私聊可以直接发「好友 群」。"
+        )
+
     # ---------------- 状态 ----------------
     def _state_path(self) -> Path:
         return self.base_dir / "state.json"
@@ -794,6 +826,7 @@ class FriendGate(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def friend_cmd(self, event: AstrMessageEvent, raw_args: GreedyStr):
         """好友门卫：/好友、/好友 开|关、/好友 记录、/好友 暗号、/好友 群、/好友 群测试 <群号>"""
+        umo = str(getattr(event, "unified_msg_origin", "") or "") or None
         parts = str(raw_args or "").split()
         sub = parts[0] if parts else ""
         arg = " ".join(parts[1:]).strip()
@@ -1040,6 +1073,9 @@ class FriendGate(Star):
                 "名单：/好友 群白 群号 | 群黑 群号（-群号 删除，空 清空）",
                 "暗号：/好友 群暗号 词 | 群暗号 空",
             ]
+            hint = self._prefix_hint(umo)
+            if hint:
+                lines.extend(["", hint])
             yield event.plain_result("\n".join(lines))
             return
 
@@ -1071,4 +1107,7 @@ class FriendGate(Star):
         ]
         if reject_reason:
             lines.insert(6, f"拒绝时回复：{reject_reason}")
+        hint = self._prefix_hint(umo)
+        if hint:
+            lines.append(hint)
         yield event.plain_result("\n".join(lines))
