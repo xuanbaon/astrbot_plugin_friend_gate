@@ -22,7 +22,7 @@ help: |-
   /好友 群黑 <群号>    加群黑名单（同上）
   /好友 群暗号 <词>    邀请附言要含的词
   /好友 群测试 <群号> [附言]    只试跑群邀请规则
-version: 1.2.1
+version: 1.2.2
 author: xuanbaon
 repo: https://github.com/xuanbaon/astrbot_plugin_friend_gate
 astrbot_version: ">=4.17.0"
