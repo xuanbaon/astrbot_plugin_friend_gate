@@ -1,0 +1,91 @@
+{
+  "enabled": {
+    "description": "启用好友门卫",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后所有好友申请原样留在 QQ 里，等你手动处理。"
+  },
+  "notify_admin": {
+    "description": "处理结果通知管理员",
+    "type": "bool",
+    "default": true,
+    "hint": "通过或拒绝时，私聊告诉 admins_id 里的 QQ 号。"
+  },
+  "notify_session": {
+    "description": "通知目标会话（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "填了就直接发到这个会话，优先级高于 admins_id。形如 snowluma:FriendMessage:1926319056，默认留空。"
+  },
+  "friend_remark": {
+    "description": "自动备注",
+    "type": "string",
+    "default": "",
+    "hint": "留空则不设备注。可用 {nickname} {user_id} {comment}，例如「{nickname}-群友」。部分协议端（如 SnowLuma）只接受最简参数，备注会自动降级忽略。"
+  },
+  "approve_welcome": {
+    "description": "同意后给对方发一句欢迎语",
+    "type": "string",
+    "default": "",
+    "hint": "留空则不发。例如「你好呀，我是群里的机器人，有事直接说～」。只在同意成功且协议端有回应时发送。"
+  },
+  "filter": {
+    "description": "准入规则",
+    "type": "object",
+    "items": {
+      "blacklist": {
+        "description": "黑名单 QQ",
+        "type": "list",
+        "default": [],
+        "hint": "这些账号的申请一律拒绝。"
+      },
+      "whitelist": {
+        "description": "白名单 QQ",
+        "type": "list",
+        "default": [],
+        "hint": "这些账号直接同意，跳过暗号与频率限制。"
+      },
+      "require_keyword": {
+        "description": "验证语暗号",
+        "type": "list",
+        "default": [],
+        "hint": "填了就要求验证语里含其中一个词，否则拒绝。一般只加好友不发验证语，谨慎开启。"
+      },
+      "require_comment": {
+        "description": "必须填写验证语",
+        "type": "bool",
+        "default": false,
+        "hint": "打开后，验证语为空的好友申请直接拒绝。和暗号是两件事：这个只要求「有写点什么」。"
+      },
+      "max_per_hour": {
+        "description": "每小时最多自动通过几个",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        },
+        "hint": "防止被恶意连加刷屏。0 表示不限制；超限的申请不处理，留给你人工看。"
+      }
+    }
+  },
+  "reject": {
+    "description": "拒绝设置",
+    "type": "object",
+    "items": {
+      "reject_reason": {
+        "description": "拒绝时回复的理由",
+        "type": "string",
+        "default": "",
+        "hint": "留空则用协议端默认。协议端不支持该参数时会自动降级，只做拒绝不附理由。"
+      },
+      "auto_approve_group_invite": {
+        "description": "顺便自动同意入群邀请",
+        "type": "bool",
+        "default": false,
+        "hint": "打开后，有人邀请机器人进群会自动同意。建议先不开。"
+      }
+    }
+  }
+}
