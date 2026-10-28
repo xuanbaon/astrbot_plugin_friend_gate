@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 data/
 .venv/
+*.bak
+*.bak-*
+.ruff_cache/
